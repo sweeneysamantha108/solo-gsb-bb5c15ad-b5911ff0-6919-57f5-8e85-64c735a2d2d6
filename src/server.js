@@ -33,6 +33,7 @@ import {
   listActiveSuspensions,
   insertSuspension,
   revokeSuspension,
+  replaceFixedHoles,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -51,6 +52,7 @@ import {
   validateTubes,
   validateWeights,
   validateExclusions,
+  validateFixedHoles,
 } from './validate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -132,6 +134,28 @@ export function createApp(db) {
             '请先解除相关避邻对，或保留对应离心管编号',
           ]);
         }
+        // 替换离心管同样不得使固定孔位绑定失效：
+        // 被绑定管不再存在、或固定孔不再属于其可用孔位，整次拒绝并保留原数据。
+        const fixedDangling = [];
+        for (const b of current.fixedHoles || []) {
+          const nt = ids.has(b.tubeId) ? clean.find((t) => t.id === b.tubeId) : null;
+          if (!nt) {
+            fixedDangling.push(
+              `固定孔位：离心管「${b.tubeId}」不再存在（原固定于孔 ${b.hole}）`,
+            );
+          } else if (!nt.usableHoles.includes(b.hole)) {
+            fixedDangling.push(
+              `固定孔位：孔 ${b.hole} 不再属于离心管「${b.tubeId}」的可用孔位`,
+            );
+          }
+        }
+        if (fixedDangling.length > 0) {
+          throw new ValidationError([
+            '本次离心管替换会使现有固定孔位绑定失效，已拒绝并保留原数据：',
+            ...fixedDangling,
+            '请先清空或修改固定孔位绑定，或保留对应离心管编号与可用孔位',
+          ]);
+        }
         db.prepare('DELETE FROM tube_holes').run();
         db.prepare('DELETE FROM tubes').run();
         const insTube = db.prepare('INSERT INTO tubes (id, mass, ord) VALUES (?, ?, ?)');
@@ -167,6 +191,33 @@ export function createApp(db) {
           'INSERT INTO exclusion_pairs (tube_a, tube_b, ord) VALUES (?, ?, ?)',
         );
         clean.forEach((p, i) => ins.run(p.a, p.b, i));
+      });
+      tx(req.body);
+      res.json({ ok: true, currentHash: currentHash(db) });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 固定孔位绑定（整体替换，事务） ----------
+  //
+  // 实验人员预先摆好部分离心管时，按「已录入管编号 ↔ 孔位」整组保存固定绑定。
+  // 未知管、重复管/孔、越界孔及不在该管可用孔位内（含该孔承重不足）的绑定整组拒绝，
+  // 不留下部分数据；空数组表示清空（清空后无固定孔位，行为与现状一致）。
+  // 修改管可用孔位（PUT /api/tubes）或转子孔数（PUT /api/config）若使绑定失效，
+  // 同样整次拒绝。绑定纳入数据指纹：变化后旧图不可用于当前装载（历史不改写）。
+
+  app.get('/api/fixed-holes', (req, res) => {
+    const data = loadData(db);
+    res.json(data ? data.fixedHoles : []);
+  });
+
+  app.put('/api/fixed-holes', (req, res, next) => {
+    try {
+      const tx = db.transaction((body) => {
+        const current = loadData(db);
+        const clean = validateFixedHoles(body, current);
+        replaceFixedHoles(db, clean);
       });
       tx(req.body);
       res.json({ ok: true, currentHash: currentHash(db) });

@@ -58,13 +58,21 @@ export function validateConfig(input, currentData) {
     });
   }
 
-  // 缩小孔位范围前，现有离心管的可用孔位不得越界
+  // 缩小孔位范围前，现有离心管的可用孔位与固定孔位绑定均不得越界；
+  // 两类问题各自收集、一并报告（整次拒绝，保留原配置）。
   if (errors.length === 0 && currentData) {
     for (const t of currentData.tubes) {
       const bad = t.usableHoles.filter((h) => h >= holes);
       if (bad.length > 0) {
         errors.push(
           `缩小孔位至 ${holes} 会使离心管「${t.id}」的可用孔位 ${bad.join(', ')} 越界，请先修改该离心管`,
+        );
+      }
+    }
+    for (const b of currentData.fixedHoles || []) {
+      if (b.hole >= holes) {
+        errors.push(
+          `缩小孔位至 ${holes} 会使离心管「${b.tubeId}」的固定孔位 ${b.hole} 越界，请先清空或修改固定孔位绑定`,
         );
       }
     }
@@ -193,5 +201,75 @@ export function validateExclusions(input, currentData) {
   normalized.sort((x, y) =>
     x.a < y.a ? -1 : x.a > y.a ? 1 : x.b < y.b ? -1 : x.b > y.b ? 1 : 0,
   );
+  return normalized;
+}
+
+// 固定孔位绑定（整体替换）：实验人员预先摆好的离心管按「管编号 ↔ 孔位」整组保存。
+// 未知管、越界孔、孔不在该管可用孔位内、该孔承重不足，或一支管/一个孔重复绑定，
+// 任一出现即整次拒绝（不留下部分数据）。空数组表示清空（回到无固定孔位流程）。
+// 返回规范化结果 [{tubeId, hole}]，按孔位升序排列。
+export function validateFixedHoles(input, currentData) {
+  const errors = [];
+  assert(Array.isArray(input), errors, '固定孔位绑定列表必须是数组');
+  if (!Array.isArray(input)) throw new ValidationError(errors);
+  if (!currentData) throw new ValidationError(['请先配置转子（孔位数、各孔最大质量、容差）']);
+
+  const N = currentData.holes;
+  const tubeMap = new Map(currentData.tubes.map((t) => [t.id, t]));
+  const seenTube = new Set();
+  const seenHole = new Set();
+  const normalized = [];
+
+  input.forEach((row, i) => {
+    const where = `第 ${i + 1} 条固定孔位绑定`;
+    assert(row !== null && typeof row === 'object', errors, `${where}格式不正确`);
+    if (!row || typeof row !== 'object') return;
+
+    const rawId = row.tubeId !== undefined ? row.tubeId : row.tube;
+    const tubeId = typeof rawId === 'string' ? rawId.trim() : '';
+    const hole = row.hole;
+    assert(tubeId.length > 0, errors, `${where}：离心管编号不能为空`);
+    if (!tubeId) return;
+
+    const t = tubeMap.get(tubeId);
+    if (!t) {
+      errors.push(`${where}：离心管编号「${tubeId}」不存在于当前录入（未知管不能绑定固定孔位）`);
+      return;
+    }
+    if (!isInt(hole) || hole < 0 || hole >= N) {
+      errors.push(`${where}：离心管「${tubeId}」的孔位 ${hole} 越界（允许 0..${N - 1}）`);
+      return;
+    }
+    if (!t.usableHoles.includes(hole)) {
+      errors.push(
+        `${where}：离心管「${tubeId}」不能绑定孔 ${hole}，该孔不在其可用孔位（${t.usableHoles.join(', ')}）内`,
+      );
+      return;
+    }
+    if (t.mass > currentData.holeMaxMass[hole]) {
+      errors.push(
+        `${where}：离心管「${tubeId}」质量 ${t.mass} 超过孔 ${hole} 的最大承重 ${currentData.holeMaxMass[hole]}，不能固定在该孔`,
+      );
+      return;
+    }
+    if (seenTube.has(tubeId)) {
+      errors.push(`${where}：离心管「${tubeId}」被重复绑定到多个孔位（一支管只能固定一个孔位）`);
+      return;
+    }
+    if (seenHole.has(hole)) {
+      // 找到先前占用该孔的管，便于定位
+      const prev = normalized.find((b) => b.hole === hole);
+      errors.push(
+        `${where}：孔 ${hole} 被重复绑定给多支离心管（「${prev ? prev.tubeId : '?'}」与「${tubeId}」），一个孔位只能固定一支管`,
+      );
+      return;
+    }
+    seenTube.add(tubeId);
+    seenHole.add(hole);
+    normalized.push({ tubeId, hole });
+  });
+
+  if (errors.length) throw new ValidationError(errors);
+  normalized.sort((a, b) => a.hole - b.hole);
   return normalized;
 }

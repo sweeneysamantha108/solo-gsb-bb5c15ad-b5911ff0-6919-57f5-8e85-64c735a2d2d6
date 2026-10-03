@@ -275,3 +275,15 @@ tr.row-stale { opacity: 0.6; }
   flex-wrap: wrap;
   margin-bottom: 6px;
 }
+
+/* 固定孔位标记 */
+.slot-fixed { outline: 2px solid #d98a00; outline-offset: -2px; }
+.tag-fixed {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 0 6px;
+  font-size: 12px;
+  color: #8a5a00;
+  background: #fff2d6;
+  border-radius: 10px;
+}

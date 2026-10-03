@@ -53,6 +53,20 @@ CREATE TABLE IF NOT EXISTS exclusion_pairs (
   PRIMARY KEY (tube_a, tube_b)
 );
 
+-- 固定孔位绑定：实验人员预先摆好的离心管按「管编号 ↔ 孔位」整组保存。
+-- 整体替换维护；不设外键（tube_holes 整表替换时先 DELETE 子表，外键反而阻碍事务），
+-- 悬空绑定由服务端在各写入事务内校验拦截。固定绑定纳入数据指纹：绑定变化使
+-- 旧发布图不可用于当前装载，但不改写历史；清空后指纹与无绑定数据一致。
+CREATE TABLE IF NOT EXISTS fixed_holes (
+  tube_id TEXT NOT NULL,
+  hole INTEGER NOT NULL,
+  ord INTEGER NOT NULL,
+  PRIMARY KEY (tube_id, hole)
+);
+-- 一支管至多固定在一个孔位；一个孔位至多固定一支管（服务端已校验，索引兜底）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fixed_hole ON fixed_holes(hole);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fixed_tube ON fixed_holes(tube_id);
+
 CREATE TABLE IF NOT EXISTS drafts (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   basis_hash TEXT NOT NULL,
@@ -155,6 +169,10 @@ export function loadData(db) {
     .prepare('SELECT tube_a, tube_b FROM exclusion_pairs ORDER BY tube_a, tube_b')
     .all()
     .map((r) => ({ a: r.tube_a, b: r.tube_b }));
+  const fixedHoles = db
+    .prepare('SELECT tube_id, hole FROM fixed_holes ORDER BY ord, rowid')
+    .all()
+    .map((r) => ({ tubeId: r.tube_id, hole: r.hole }));
   return {
     holes: N,
     tolerance: cfg.tolerance,
@@ -162,6 +180,7 @@ export function loadData(db) {
     tubes,
     weights,
     exclusionPairs,
+    fixedHoles,
   };
 }
 
@@ -230,6 +249,16 @@ export function saveDraft(db, { basisHash, feasible, reasons, result }) {
        result_json = excluded.result_json,
        computed_at = datetime('now')`,
   ).run(basisHash, feasible ? 1 : 0, JSON.stringify(reasons ?? []), JSON.stringify(result));
+}
+
+// ---------- 固定孔位绑定（整体替换，由 server 在单事务内校验后调用） ----------
+
+export function replaceFixedHoles(db, bindings) {
+  db.prepare('DELETE FROM fixed_holes').run();
+  const ins = db.prepare(
+    'INSERT INTO fixed_holes (tube_id, hole, ord) VALUES (?, ?, ?)',
+  );
+  bindings.forEach((b, i) => ins.run(b.tubeId, b.hole, i));
 }
 
 // ---------- 发布（由 server 在单事务内调用） ----------

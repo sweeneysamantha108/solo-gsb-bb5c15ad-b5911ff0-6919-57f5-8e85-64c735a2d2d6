@@ -15,6 +15,7 @@ let editorN = null;
 let tubeRows = []; // {id, mass, holes:Set}
 let weightRows = []; // {mass, quantity}
 let exclRows = []; // 避邻对编辑行：{a, b}（管编号）
+let fixedRows = []; // 固定孔位编辑行：{tubeId, hole}
 
 // ---------- 通用 ----------
 
@@ -74,14 +75,17 @@ function renderAll() {
       }));
       weightRows = d.weights.map((w) => ({ mass: w.mass, quantity: w.quantity }));
       exclRows = (d.exclusionPairs || []).map((p) => ({ a: p.a, b: p.b }));
+      fixedRows = (d.fixedHoles || []).map((b) => ({ tubeId: b.tubeId, hole: b.hole }));
     } else {
       exclRows = [];
+      fixedRows = [];
     }
   }
 
   renderHoleMax(d);
   renderTubeTable(N);
   renderExclusionTable();
+  renderFixedTable();
   renderWeightTable();
   renderDraft();
   renderPublications();
@@ -247,6 +251,86 @@ $('#save-exclusions').addEventListener('click', async () => {
   } catch (e) { showAlert(e.message, 'err'); }
 });
 
+// ---------- 固定孔位表 ----------
+
+// 孔位下拉选项；仅列出指定管的可用孔位（服务端会再次校验，这里做提示性过滤）
+function holeOptions(tubeId, selected, N) {
+  const tube = state.data ? state.data.tubes.find((t) => t.id === tubeId) : null;
+  const usable = tube ? tube.usableHoles : N ? Array.from({ length: N }, (_, h) => h) : [];
+  const opts = ['<option value="">（选择孔位）</option>'];
+  for (const h of usable) {
+    opts.push(`<option value="${h}"${h === selected ? ' selected' : ''}>孔 ${h}</option>`);
+  }
+  if (selected !== '' && selected != null && !usable.includes(Number(selected))) {
+    opts.push(`<option value="${selected}" selected>孔 ${selected}（不在可用孔位）</option>`);
+  }
+  return opts.join('');
+}
+
+function renderFixedTable() {
+  const tbody = $('#fixed-table tbody');
+  const N = state.data ? state.data.holes : editorN;
+  tbody.innerHTML = '';
+  fixedRows.forEach((row, i) => {
+    const tr = document.createElement('tr');
+
+    const tdTube = document.createElement('td');
+    const selTube = document.createElement('select');
+    selTube.innerHTML = tubeIdOptions(row.tubeId);
+    selTube.addEventListener('change', () => {
+      row.tubeId = selTube.value;
+      row.hole = '';
+      renderFixedTable();
+    });
+    tdTube.appendChild(selTube);
+
+    const tdHole = document.createElement('td');
+    const selHole = document.createElement('select');
+    selHole.innerHTML = holeOptions(row.tubeId, row.hole, N);
+    selHole.addEventListener('change', () => {
+      row.hole = selHole.value === '' ? '' : Number(selHole.value);
+    });
+    tdHole.appendChild(selHole);
+
+    const tdDel = document.createElement('td');
+    const del = document.createElement('button');
+    del.className = 'danger';
+    del.textContent = '删除';
+    del.addEventListener('click', () => { fixedRows.splice(i, 1); renderFixedTable(); });
+    tdDel.appendChild(del);
+
+    tr.append(tdTube, tdHole, tdDel);
+    tbody.appendChild(tr);
+  });
+}
+
+$('#add-fixed').addEventListener('click', () => {
+  if (!state.data) return showAlert('请先保存转子配置并录入离心管。', 'err');
+  fixedRows.push({ tubeId: '', hole: '' });
+  renderFixedTable();
+});
+
+async function saveFixed(rows, okMsg) {
+  await api('PUT', '/api/fixed-holes', rows);
+  const r = await api('POST', '/api/solve');
+  await refresh();
+  if (r.feasible) showAlert(okMsg, 'ok');
+  else showAlert('固定孔位已保存，但不存在可行装载图：\n' + r.reasons.join('\n'), 'err');
+}
+
+$('#save-fixed').addEventListener('click', async () => {
+  try {
+    const body = fixedRows.map((r) => ({ tubeId: r.tubeId, hole: r.hole }));
+    await saveFixed(body, '固定孔位已保存，装载图已按当前数据重算。');
+  } catch (e) { showAlert(e.message, 'err'); }
+});
+
+$('#clear-fixed').addEventListener('click', async () => {
+  try {
+    await saveFixed([], '固定孔位已清空（恢复为无固定孔位配平）。');
+  } catch (e) { showAlert(e.message, 'err'); }
+});
+
 // ---------- 配重表 ----------
 
 function renderWeightTable() {
@@ -324,6 +408,9 @@ $('#save-tubes').addEventListener('click', async () => {
     await saveTubes();
     const r = await api('POST', '/api/solve');
     await refresh();
+    // 固定绑定未随本次提交编辑：丢弃可能引用了旧管编号的本地行，以服务端为准
+    fixedRows = (state.data.fixedHoles || []).map((b) => ({ tubeId: b.tubeId, hole: b.hole }));
+    renderFixedTable();
     if (r.feasible) showAlert('离心管已保存，装载图已按当前数据重算。', 'ok');
     else showAlert('离心管已保存，但不存在可行装载图：\n' + r.reasons.join('\n'), 'err');
   } catch (e) { showAlert(e.message, 'err'); }
@@ -341,21 +428,25 @@ $('#save-weights').addEventListener('click', async () => {
 
 // ---------- 草稿展示 ----------
 
-function slotHtml(h, slot) {
+function slotHtml(h, slot, fixedRef = null) {
+  const fixedTag = fixedRef
+    ? `<span class="tag-fixed" title="固定孔位：${escapeHtml(fixedRef)}">📌 固定</span>`
+    : '';
   if (!slot) {
     return `<div class="slot empty"><span class="hole-no">孔 ${h}</span>
-      <span class="ref">空</span><span class="mass">0 g</span></div>`;
+      <span class="ref">空</span><span class="mass">0 g</span>${fixedTag}</div>`;
   }
   const cls = slot.kind === 'tube' ? 'tube' : 'weight';
   const tag = slot.kind === 'tube' ? '离心管' : '配重块';
-  return `<div class="slot ${cls}"><span class="hole-no">孔 ${h}</span>
+  return `<div class="slot ${cls}${fixedRef ? ' slot-fixed' : ''}"><span class="hole-no">孔 ${h}</span>
     <span class="ref">${escapeHtml(slot.ref)}</span>
-    <span class="mass">${tag} · ${fmt(slot.mass)} g</span></div>`;
+    <span class="mass">${tag} · ${fmt(slot.mass)} g</span>${fixedTag}</div>`;
 }
 
-function arrangementHtml(result) {
+function arrangementHtml(result, fixedHoles = []) {
+  const fixedMap = new Map(fixedHoles.map((b) => [b.hole, b.tubeId]));
   return `<div class="rotor-layout">${result.arrangement
-    .map((s, h) => slotHtml(h, s))
+    .map((s, h) => slotHtml(h, s, fixedMap.has(h) ? fixedMap.get(h) : null))
     .join('')}</div>
   <table class="pair-list">
     <thead><tr><th>对径孔对</th><th>A 侧质量</th><th>B 侧质量</th><th>差值</th><th>容差判定</th></tr></thead>
@@ -398,13 +489,15 @@ function renderDraft() {
   }
   const r = draft.result;
   const excl = state.data && state.data.exclusionPairs ? state.data.exclusionPairs : [];
+  const fixed = state.data && state.data.fixedHoles ? state.data.fixedHoles : [];
   body.innerHTML = `
     <div class="metrics">
       <div>使用配重块：<b>${r.weightCount}</b> 枚（已最小化）</div>
       <div>各对径差之和：<b>${fmt(r.diffSum)}</b> g（同配重数下已最小化）</div>
       <div>避邻规则：<b>${excl.length}</b> 对（已纳入求解）</div>
+      <div>固定孔位：<b>${fixed.length}</b> 处（📌 标记，求解必须满足）</div>
     </div>
-    ${arrangementHtml(r)}`;
+    ${arrangementHtml(r, fixed)}`;
   pubBtn.disabled = draft.stale;
 }
 
@@ -473,17 +566,26 @@ async function openPublication(id) {
   const exclText = excl.length
     ? `${excl.length} 对：${excl.map((x) => `${x.a} ↔ ${x.b}`).join('，')}`
         : '未配置（按无规则装载）';
+  const fixed = p.config && Array.isArray(p.config.fixedHoles) ? p.config.fixedHoles : [];
+  const fixedText = fixed.length
+    ? `${fixed.length} 处：${fixed
+        .slice()
+        .sort((a, b) => a.hole - b.hole)
+        .map((x) => `${x.tubeId} → 孔 ${x.hole}`)
+        .join('，')}`
+    : '无（未固定任何孔位）';
   $('#pub-detail').innerHTML = `
     <div class="actions" style="margin-top:0">${badge}
       <span class="muted">发布时间 ${p.createdAt}</span></div>
     <p class="muted" style="font-family:ui-monospace,monospace;font-size:12px">
       数据依据 sha256:${p.basisHash}</p>
     <p class="muted">冻结的避邻规则：${escapeHtml(exclText)}</p>
+    <p class="muted">冻结的固定孔位：${escapeHtml(fixedText)}</p>
     ${p.feasible
       ? `<div class="metrics">
           <div>配重块：<b>${p.weightCount}</b> 枚</div>
           <div>对径差之和：<b>${fmt(p.diffSum)}</b> g</div>
-        </div>${arrangementHtml(p.result)}`
+        </div>${arrangementHtml(p.result, fixed)}`
       : `<div class="banner bad">${p.reasons.map(escapeHtml).join('<br>')}</div>`}
     <details class="snapshot-block">
       <summary>发布时冻结的录入数据（依据快照）</summary>
