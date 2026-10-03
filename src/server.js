@@ -51,6 +51,7 @@ import {
   validateTubes,
   validateWeights,
   validateExclusions,
+  validateFixedSlots,
 } from './validate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -132,6 +133,19 @@ export function createApp(db) {
             '请先解除相关避邻对，或保留对应离心管编号',
           ]);
         }
+        // 替换离心管不得使现有固定孔位失效（管不再存在或孔位不再可用）：整次拒绝并保留原数据
+        const newTubeMap = new Map(clean.map((t) => [t.id, t]));
+        const brokenFixed = (current ? current.fixedSlots : []).filter((f) => {
+          const t = newTubeMap.get(f.tube);
+          return !t || !t.usableHoles.includes(f.hole);
+        });
+        if (brokenFixed.length > 0) {
+          throw new ValidationError([
+            '本次离心管替换会使现有固定孔位失效（管不再存在或孔位不再可用），已拒绝并保留原数据：',
+            ...brokenFixed.map((f) => `固定孔位 ${f.hole}：离心管「${f.tube}」`),
+            '请先解除相关固定孔位，或保留对应离心管编号与可用孔位',
+          ]);
+        }
         db.prepare('DELETE FROM tube_holes').run();
         db.prepare('DELETE FROM tubes').run();
         const insTube = db.prepare('INSERT INTO tubes (id, mass, ord) VALUES (?, ?, ?)');
@@ -167,6 +181,34 @@ export function createApp(db) {
           'INSERT INTO exclusion_pairs (tube_a, tube_b, ord) VALUES (?, ?, ?)',
         );
         clean.forEach((p, i) => ins.run(p.a, p.b, i));
+      });
+      tx(req.body);
+      res.json({ ok: true, currentHash: currentHash(db) });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 固定孔位（整体替换，事务） ----------
+  // 实验人员预先摆好的离心管：按「管编号 + 孔位」整组保存/修改/清空。
+  // 未知管、重复管或孔、越界孔、不在该管可用孔位内的绑定，任一出现即整组拒绝，
+  // 不留下部分数据（原绑定保留）。
+
+  app.get('/api/fixed-slots', (req, res) => {
+    const data = loadData(db);
+    res.json(data ? data.fixedSlots : []);
+  });
+
+  app.put('/api/fixed-slots', (req, res, next) => {
+    try {
+      const tx = db.transaction((body) => {
+        const current = loadData(db);
+        const clean = validateFixedSlots(body, current);
+        db.prepare('DELETE FROM fixed_slots').run();
+        const ins = db.prepare(
+          'INSERT INTO fixed_slots (tube_id, hole, ord) VALUES (?, ?, ?)',
+        );
+        clean.forEach((f, i) => ins.run(f.tube, f.hole, i));
       });
       tx(req.body);
       res.json({ ok: true, currentHash: currentHash(db) });

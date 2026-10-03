@@ -68,6 +68,14 @@ export function validateConfig(input, currentData) {
         );
       }
     }
+    // 缩小孔位范围前，现有固定孔位不得越界（否则绑定失效）
+    for (const f of currentData.fixedSlots || []) {
+      if (f.hole >= holes) {
+        errors.push(
+          `缩小孔位至 ${holes} 会使固定孔位 ${f.hole}（离心管「${f.tube}」）越界，请先解除该固定孔位`,
+        );
+      }
+    }
   }
 
   if (errors.length) throw new ValidationError(errors);
@@ -146,6 +154,62 @@ export function validateWeights(input, N) {
   });
 
   if (errors.length) throw new ValidationError(errors);
+  return normalized;
+}
+
+// 固定孔位（整体替换）：未知管、重复管或孔、越界孔、不在该管可用孔位内的绑定，
+// 任一出现即整组拒绝（调用方回滚，原绑定保留）。
+// 绑定为无序集合：按孔位升序规范化存储，保证数据指纹稳定。
+export function validateFixedSlots(input, currentData) {
+  const errors = [];
+  assert(Array.isArray(input), errors, '固定孔位列表必须是数组');
+  if (!Array.isArray(input)) throw new ValidationError(errors);
+  const N = currentData ? currentData.holes : null;
+  if (N === null) throw new ValidationError(['请先配置转子孔位数']);
+
+  const tubeMap = new Map((currentData.tubes || []).map((t) => [t.id, t]));
+  const seenTubes = new Set();
+  const seenHoles = new Set();
+  const normalized = [];
+  input.forEach((row, i) => {
+    const where = `第 ${i + 1} 项固定孔位`;
+    assert(row !== null && typeof row === 'object', errors, `${where}格式不正确`);
+    if (!row || typeof row !== 'object') return;
+
+    const tube = typeof row.tube === 'string' ? row.tube.trim() : '';
+    assert(tube.length > 0, errors, `${where}：离心管编号不能为空`);
+    const hole = row.hole;
+    assert(
+      isInt(hole) && hole >= 0 && hole < N,
+      errors,
+      `${where}：孔位 ${hole === '' ? '（空）' : hole} 越界或非法（允许 0..${N - 1} 的整数）`,
+    );
+    if (!tube || !isInt(hole) || hole < 0 || hole >= N) return;
+
+    if (seenTubes.has(tube)) {
+      errors.push(`${where}：离心管「${tube}」重复绑定（每管最多一个固定孔位）`);
+    }
+    seenTubes.add(tube);
+    if (seenHoles.has(hole)) {
+      errors.push(`${where}：孔位 ${hole} 重复绑定（每孔最多一支固定离心管）`);
+    }
+    seenHoles.add(hole);
+
+    const t = tubeMap.get(tube);
+    if (!t) {
+      errors.push(`${where}：离心管编号「${tube}」不存在于当前录入（未知编号）`);
+    } else if (!t.usableHoles.includes(hole)) {
+      errors.push(
+        `${where}：孔位 ${hole} 不在离心管「${tube}」的可用孔位内（可用：${t.usableHoles.join(', ')}）`,
+      );
+    }
+    normalized.push({ tube, hole });
+  });
+
+  if (errors.length) throw new ValidationError(errors);
+  normalized.sort((x, y) =>
+    x.hole - y.hole || (x.tube < y.tube ? -1 : x.tube > y.tube ? 1 : 0),
+  );
   return normalized;
 }
 

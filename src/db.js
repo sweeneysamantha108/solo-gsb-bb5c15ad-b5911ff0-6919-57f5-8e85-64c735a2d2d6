@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS exclusion_pairs (
   PRIMARY KEY (tube_a, tube_b)
 );
 
+-- 固定孔位：实验人员预先摆好的离心管（管编号 → 孔位）。
+-- 整体替换维护；每管最多一个固定孔位、每孔最多一支固定管（主键/唯一约束兜底），
+-- 按孔位升序存取，使绑定作为无序集合拥有稳定的数据指纹。
+CREATE TABLE IF NOT EXISTS fixed_slots (
+  tube_id TEXT NOT NULL PRIMARY KEY,
+  hole INTEGER NOT NULL UNIQUE,
+  ord INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS drafts (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   basis_hash TEXT NOT NULL,
@@ -155,6 +164,10 @@ export function loadData(db) {
     .prepare('SELECT tube_a, tube_b FROM exclusion_pairs ORDER BY tube_a, tube_b')
     .all()
     .map((r) => ({ a: r.tube_a, b: r.tube_b }));
+  const fixedSlots = db
+    .prepare('SELECT tube_id, hole FROM fixed_slots ORDER BY hole, tube_id')
+    .all()
+    .map((r) => ({ tube: r.tube_id, hole: r.hole }));
   return {
     holes: N,
     tolerance: cfg.tolerance,
@@ -162,6 +175,7 @@ export function loadData(db) {
     tubes,
     weights,
     exclusionPairs,
+    fixedSlots,
   };
 }
 

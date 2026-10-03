@@ -7,6 +7,8 @@
 //   任一孔内物件质量不得超过该孔最大承重；每对对径孔质量差不得超过容差。
 //   避邻规则：环形孔位中孔 i 与孔 (i+1)%N 相邻；data.exclusionPairs 中同对的
 //   两支离心管不得占据相邻孔位（未配置规则时等价于无此约束）。
+//   固定孔位：data.fixedSlots 中指定的离心管必须占据指定孔位（未配置时等价于
+//   无此约束）；固定管不得出现在其他孔位，固定孔位不得放置其他物件。
 //
 // 优化目标（字典序）：
 //   1) 使用配重块数量最少
@@ -44,13 +46,17 @@ export function canonicalData(data) {
   return canon(data);
 }
 
-// 数据指纹：未配置避邻规则（exclusionPairs 为空或缺失）时哈希与不含该字段的
-// 历史数据完全一致——旧发布图仍按原规则判定可用；一旦配置了规则，规则内容
-// 即纳入指纹，规则变化会使旧发布图不可用于当前装载（历史图本身不改写）。
+// 数据指纹：未配置避邻规则（exclusionPairs 为空或缺失）或固定孔位（fixedSlots 为空或
+// 缺失）时，哈希与不含对应字段的历史数据完全一致——旧发布图仍按原规则判定可用；
+// 一旦配置了规则/绑定，其内容即纳入指纹，变化会使旧发布图不可用于当前装载
+// （历史图本身不改写）；清空后指纹回到与无规则/无绑定一致。
 export function computeHash(data) {
   const payload = { ...data };
   if (!Array.isArray(payload.exclusionPairs) || payload.exclusionPairs.length === 0) {
     delete payload.exclusionPairs;
+  }
+  if (!Array.isArray(payload.fixedSlots) || payload.fixedSlots.length === 0) {
+    delete payload.fixedSlots;
   }
   return crypto
     .createHash('sha256')
@@ -137,7 +143,54 @@ export function solve(data) {
   const clashes = (code, curIdx) =>
     code > 0 && curIdx >= 0 && forbidden.has(pairKeyOf(sList[code - 1], curIdx));
 
+  // ---------- 固定孔位预处理 ----------
+  // 指定管必须占据指定孔位：fixedTubeAtHole（孔 → 管索引）使该孔只接受这一支管；
+  // fixedHoleOfTube（管索引 → 孔）使该管不得出现在其他孔位。不增加 DP 状态维度，
+  // 仅收缩各孔位的放置选项，优化目标与求解顺序保持不变。
+  const fixedList = Array.isArray(data.fixedSlots) ? data.fixedSlots : [];
+  const fixedTubeAtHole = new Map(); // 孔 → 管索引
+  const fixedHoleOfTube = new Map(); // 管索引 → 孔
+  const fixedInvalid = [];
+  for (const f of fixedList) {
+    if (!f || typeof f !== 'object') continue;
+    const idx = tubeIdx.get(f.tube);
+    const h = f.hole;
+    // 校验层已拦截以下情形，此处为防御性检查
+    if (idx === undefined) {
+      fixedInvalid.push(`固定孔位绑定的离心管「${f.tube}」不存在于当前录入`);
+      continue;
+    }
+    if (!Number.isInteger(h) || h < 0 || h >= N) {
+      fixedInvalid.push(`固定孔位绑定的孔位 ${h} 越界（允许 0..${N - 1}）`);
+      continue;
+    }
+    if (fixedHoleOfTube.has(idx)) {
+      fixedInvalid.push(`离心管「${f.tube}」被重复绑定固定孔位`);
+      continue;
+    }
+    if (fixedTubeAtHole.has(h)) {
+      fixedInvalid.push(`孔位 ${h} 被重复绑定固定离心管`);
+      continue;
+    }
+    fixedHoleOfTube.set(idx, h);
+    fixedTubeAtHole.set(h, idx);
+  }
+
   const reasons = [];
+  if (fixedInvalid.length > 0) {
+    reasons.push('固定孔位绑定与当前录入数据不一致：', ...fixedInvalid);
+  }
+  for (const [h, idx] of fixedTubeAtHole) {
+    const t = tubes[idx];
+    if (!t.usableHoles.includes(h)) {
+      reasons.push(`离心管「${t.id}」固定在孔 ${h}，但该孔不在其可用孔位内`);
+    }
+    if (t.mass > maxMass[h] + EPS) {
+      reasons.push(
+        `离心管「${t.id}」固定在孔 ${h}，但其质量 ${t.mass} 超过该孔最大承重（${maxMass[h]}）`,
+      );
+    }
+  }
   if (T > N) {
     reasons.push(`离心管数量（${T}）超过转子孔位总数（${N}）`);
   }
@@ -161,8 +214,25 @@ export function solve(data) {
 
   // 某孔位可放置的物件清单
   const fillsAt = (h) => {
+    // 固定孔位：该孔只接受绑定的离心管（不放空、不放配重、不放其他管）
+    const fixedIdx = fixedTubeAtHole.get(h);
+    if (fixedIdx !== undefined) {
+      const t = tubes[fixedIdx];
+      if (!t.usableHoles.includes(h) || t.mass > maxMass[h] + EPS) return [];
+      return [
+        {
+          empty: false,
+          kind: 'tube',
+          idx: fixedIdx,
+          ref: t.id,
+          mass: t.mass,
+          slot: { t: 0, id: t.id },
+        },
+      ];
+    }
     const fills = [{ empty: true, mass: 0, slot: EMPTY }];
     for (let idx = 0; idx < T; idx += 1) {
+      if (fixedHoleOfTube.has(idx)) continue; // 固定管只能占据其固定孔位
       const t = tubes[idx];
       if (t.usableHoles.includes(h) && t.mass <= maxMass[h] + EPS) {
         fills.push({
@@ -246,8 +316,13 @@ export function solve(data) {
       }
     }
     if (opts.length === 0) {
+      const fixedNote = [holeA, holeB]
+        .filter((h) => fixedTubeAtHole.has(h))
+        .map((h) => `孔 ${h} 固定放置离心管「${tubes[fixedTubeAtHole.get(h)].id}」`)
+        .join('；');
       reasons.push(
-        `对径孔对（${holeA} ↔ ${holeB}）不存在满足承重与容差的放置方式`,
+        `对径孔对（${holeA} ↔ ${holeB}）不存在满足承重与容差的放置方式` +
+          (fixedNote ? `（${fixedNote}）` : ''),
       );
       return { feasible: false, reasons };
     }
@@ -342,18 +417,50 @@ export function solve(data) {
   }
 
   if (!best) {
-    // 无解时说明冲突来源：若忽略避邻规则存在可行图，则冲突来自避邻规则本身
-    if (exclPairs.length > 0) {
-      const relaxed = solve({ ...data, exclusionPairs: [] });
-      if (relaxed.feasible) {
+    // 无解时说明冲突来源：若忽略固定孔位/避邻规则后存在可行图，则冲突来自对应规则
+    const hasFixed = fixedTubeAtHole.size > 0;
+    const hasExcl = exclPairs.length > 0;
+    const fixedDesc = fixedList
+      .map((f) => (f && typeof f === 'object' ? `「${f.tube}」→ 孔 ${f.hole}` : ''))
+      .filter(Boolean)
+      .join('、');
+    const fixedConflictReasons = () => [
+      `不存在同时满足固定孔位的装载图：当前 ${fixedList.length} 项固定孔位（${fixedDesc}）与装载约束相互冲突`,
+      '忽略固定孔位时存在可行装载图；请调整固定孔位或录入数据后重试',
+    ];
+    const exclConflictReasons = () => [
+      `不存在同时满足避邻规则的装载图：当前 ${exclPairs.length} 对避邻规则（${exclPairs
+        .map((p) => `${p.a} ↔ ${p.b}`)
+        .join('、')}）与装载约束相互冲突`,
+      '忽略避邻规则时存在可行装载图；请调整避邻对或录入数据后重试',
+    ];
+    if (hasFixed || hasExcl) {
+      const relaxedAll = solve({ ...data, exclusionPairs: [], fixedSlots: [] });
+      if (relaxedAll.feasible) {
+        if (hasFixed && hasExcl) {
+          // 两类规则同时存在：分别放松以定位冲突来源
+          const relaxFixed = solve({ ...data, fixedSlots: [] });
+          if (relaxFixed.feasible) {
+            return { feasible: false, reasons: fixedConflictReasons() };
+          }
+          const relaxExcl = solve({ ...data, exclusionPairs: [] });
+          if (relaxExcl.feasible) {
+            return { feasible: false, reasons: exclConflictReasons() };
+          }
+          return {
+            feasible: false,
+            reasons: [
+              `不存在同时满足固定孔位与避邻规则的装载图：${fixedList.length} 项固定孔位（${fixedDesc}）` +
+                `与 ${exclPairs.length} 对避邻规则（${exclPairs
+                  .map((p) => `${p.a} ↔ ${p.b}`)
+                  .join('、')}）共同与装载约束相互冲突`,
+              '同时忽略固定孔位与避邻规则时存在可行装载图；请调整规则或录入数据后重试',
+            ],
+          };
+        }
         return {
           feasible: false,
-          reasons: [
-            `不存在同时满足避邻规则的装载图：当前 ${exclPairs.length} 对避邻规则（${exclPairs
-              .map((p) => `${p.a} ↔ ${p.b}`)
-              .join('、')}）与装载约束相互冲突`,
-            '忽略避邻规则时存在可行装载图；请调整避邻对或录入数据后重试',
-          ],
+          reasons: hasFixed ? fixedConflictReasons() : exclConflictReasons(),
         };
       }
     }
@@ -530,6 +637,23 @@ export function verify(data, arrangement) {
           `离心管「${p.a}」（孔 ${ha}）与「${p.b}」（孔 ${hb}）占据相邻孔位，违反避邻规则`,
         );
       }
+    }
+  }
+
+  // 固定孔位复核：指定离心管必须占据指定孔位
+  const fixedList = Array.isArray(data.fixedSlots) ? data.fixedSlots : [];
+  for (const f of fixedList) {
+    if (!f || typeof f !== 'object') continue;
+    const h = f.hole;
+    if (!Number.isInteger(h) || h < 0 || h >= N) {
+      errors.push(`固定孔位 ${h} 越界（允许 0..${N - 1}）`);
+      continue;
+    }
+    const slot = arrangement[h];
+    if (!slot || slot.kind !== 'tube' || slot.ref !== f.tube) {
+      errors.push(
+        `固定孔位 ${h} 应放置离心管「${f.tube}」，实际为「${slot ? slot.ref : '空'}」`,
+      );
     }
   }
 
